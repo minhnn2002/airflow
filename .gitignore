@@ -1,0 +1,7 @@
+.venv
+.env
+main.py
+minio_backup.py
+dags/__pycache__
+airflow/logs
+airflow/tmp

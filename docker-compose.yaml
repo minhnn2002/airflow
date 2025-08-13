@@ -1,0 +1,152 @@
+services:
+  minio:
+    container_name: minio
+    environment:
+      MINIO_ROOT_USER: miniouser
+      MINIO_ROOT_PASSWORD: miniopassword
+    image: minio/minio:latest
+    ports:
+      - "9001:9001"
+      - "9000:9000"
+    entrypoint: sh
+    command: '-c ''mkdir -p /minio_data/starrocks && minio server /minio_data --console-address ":9001"'''
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio_mc:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        mc alias set myminio http://minio:9000 miniouser miniopassword
+        mc admin user svcacct add \
+          --access-key AAAAAAAAAAAAAAAAAAAA \
+          --secret-key BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB \
+          myminio \
+          miniouser
+
+  starrocks-fe:
+    image: starrocks/fe-ubuntu:3.3-latest
+    hostname: starrocks-fe
+    container_name: starrocks-fe
+    user: root
+    command:
+      - /bin/bash
+      - -c
+      - |
+        apt-get update && \
+        apt-get install -y openssh-server && \
+        mkdir -p /var/run/sshd && \
+        echo 'root:password' | chpasswd && \
+        sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+        sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
+        sed -i 's/#Port 22/Port 2222/' /etc/ssh/sshd_config && \
+        /usr/sbin/sshd -p 2222 &
+
+        echo "# enable shared data, set storage type, set endpoint" >> /opt/starrocks/fe/conf/fe.conf
+        echo "run_mode = shared_data" >> /opt/starrocks/fe/conf/fe.conf
+        echo "cloud_native_storage_type = S3" >> /opt/starrocks/fe/conf/fe.conf
+        echo "aws_s3_endpoint = minio:9000" >> /opt/starrocks/fe/conf/fe.conf
+
+        echo "# set the path in MinIO" >> /opt/starrocks/fe/conf/fe.conf
+        echo "aws_s3_path = starrocks" >> /opt/starrocks/fe/conf/fe.conf
+
+        echo "# credentials for MinIO object read/write" >> /opt/starrocks/fe/conf/fe.conf
+        echo "aws_s3_access_key = AAAAAAAAAAAAAAAAAAAA" >> /opt/starrocks/fe/conf/fe.conf
+        echo "aws_s3_secret_key = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" >> /opt/starrocks/fe/conf/fe.conf
+        echo "aws_s3_use_instance_profile = false" >> /opt/starrocks/fe/conf/fe.conf
+        echo "aws_s3_use_aws_sdk_default_behavior = false" >> /opt/starrocks/fe/conf/fe.conf
+
+        echo "# Set this to false if you do not want default" >> /opt/starrocks/fe/conf/fe.conf
+        echo "# storage created in the object storage using" >> /opt/starrocks/fe/conf/fe.conf
+        echo "# the details provided above" >> /opt/starrocks/fe/conf/fe.conf
+        echo "enable_load_volume_from_conf = true" >> /opt/starrocks/fe/conf/fe.conf
+
+        /opt/starrocks/fe/bin/start_fe.sh --host_type FQDN
+    ports:
+      - 8030:8030
+      - 9020:9020
+      - 9030:9030
+      - 2222:2222
+    healthcheck:
+      test: 'mysql -u root -h starrocks-fe -P 9030 -e "show frontends\G" |grep "Alive: true"'
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    depends_on:
+        minio:
+            condition: service_healthy
+
+  starrocks-cn:
+    image: starrocks/cn-ubuntu:3.3-latest
+    command:
+      - /bin/bash
+      - -c
+      - |
+        sleep 15s;
+        ulimit -u 65535;
+        ulimit -n 65535;
+        mysql --connect-timeout 2 -h starrocks-fe -P9030 -uroot -e "ALTER SYSTEM ADD COMPUTE NODE \"starrocks-cn:9050\";"
+        /opt/starrocks/cn/bin/start_cn.sh
+    environment:
+      - HOST_TYPE=FQDN
+    ports:
+      - 8040:8040
+    hostname: starrocks-cn
+    container_name: starrocks-cn
+    user: root
+    depends_on:
+      starrocks-fe:
+        condition: service_healthy
+        restart: true
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: 'mysql -u root -h starrocks-fe -P 9030 -e "SHOW COMPUTE NODES\G" |grep "Alive: true"'
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      
+  airflow:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: airflow
+    volumes:
+      - ./airflow:/opt/airflow
+    ports:
+      - "56000:8080"
+    depends_on:
+      - minio
+    env_file: ".env"
+    command: >
+      bash -c "
+        # Setup SSH configuration
+        echo 'Host starrocks-fe' > /opt/airflow/.ssh/config
+        echo '  HostName starrocks-fe' >> /opt/airflow/.ssh/config
+        echo '  Port 2222' >> /opt/airflow/.ssh/config
+        echo '  User root' >> /opt/airflow/.ssh/config
+        echo '  StrictHostKeyChecking no' >> /opt/airflow/.ssh/config
+        chmod 600 /opt/airflow/.ssh/config
+        
+        # Setup MinIO clients
+        mc alias set $MINIO_ALIAS $MINIO_URL $MINIO_ACCESS $MINIO_SECRET
+        mc alias set $AWS_ALIAS $AWS_URL $AWS_ACCESS $AWS_SECRET
+        
+        # Test StarRocks FE connection
+        echo 'Testing connection to starrocks-fe...'
+        until nc -zv starrocks-fe 2222; do
+          echo 'Waiting for StarRocks FE to be ready...'
+          sleep 5
+        done
+        
+        # Start Airflow
+        airflow standalone
+      "
